@@ -2,3 +2,6 @@
 name = "peace-table"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+str_indices = "0.4"

@@ -1,14 +1,19 @@
-#![allow(dead_code)]
+mod buffer;
+mod piece;
 
-use std::{
-    num::{NonZero, NonZeroUsize},
-    ops::Index,
-};
+use str_indices::chars::count as count_chars;
+use str_indices::chars::to_byte_idx as char_to_byte;
 
+use buffer::{Buffer, Buffers};
+use piece::Piece;
+
+#[derive(Debug)]
 pub struct PieceTable<'b> {
     pieces: Vec<Piece>,
     buffers: Buffers<'b>,
-    total_size: usize,
+
+    len_chars: usize,
+    len_bytes: usize,
 }
 
 impl<'b> PieceTable<'b> {
@@ -18,18 +23,87 @@ impl<'b> PieceTable<'b> {
     ///
     /// ```
     /// # use peace_table::PieceTable;
-    /// let mut pt = PieceTable::new(b"initial");
-    /// assert_eq!(pt.content(), b"initial");
+    /// let mut pt = PieceTable::new("initial");
+    /// assert_eq!(pt.text(), "initial");
     /// ```
-    pub fn new(initial: &'b [u8]) -> Self {
-        let first_piece =
-            Piece { buffer: Buffer::Original, start: 0, length: initial.len() };
+    pub fn new(initial: &'b str) -> Self {
+        let initial_piece = Piece {
+            buffer: Buffer::Original,
+            start: 0,
+            len_bytes: initial.len(),
+            len_chars: count_chars(initial),
+        };
 
         Self {
-            pieces: vec![first_piece],
-            buffers: Buffers { original: initial, add: vec![] },
-            total_size: initial.len(),
+            pieces: vec![initial_piece],
+            buffers: Buffers::from_initial(initial),
+            len_chars: count_chars(initial),
+            len_bytes: initial.len(),
         }
+    }
+
+    /// Collect the text from the piece table.
+    pub fn text(&self) -> String {
+        let mut text = String::with_capacity(self.len_bytes);
+        for piece in &self.pieces {
+            let end = piece.start + piece.len_bytes;
+            text.push_str(&self.buffers[piece.buffer][piece.start..end]);
+        }
+
+        dbg!(&text);
+        debug_assert_eq!(text.len(), self.len_bytes);
+        debug_assert_eq!(count_chars(&text), self.len_chars);
+
+        text
+    }
+
+    /// Removes the text in the given char index range.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// # use peace_table::PieceTable;
+    /// let mut pt = PieceTable::new("hello_there");
+    /// pt.insert(5, "  ");
+    /// pt.insert(7, " ");
+    /// pt.remove(6..=8);
+    /// assert_eq!(pt.text(), "hello there");
+    /// ```
+    ///
+    /// ```
+    /// # use peace_table::PieceTable;
+    /// let mut pt = PieceTable::new("012345");
+    /// pt.remove(0..=5);
+    /// assert_eq!(pt.text(), "");
+    /// ```
+    ///
+    /// ```
+    /// # use peace_table::PieceTable;
+    /// let mut pt = PieceTable::new("012345");
+    /// pt.remove(5..0);
+    /// assert_eq!(pt.text(), "012345"); // unchanged
+    /// ```
+    pub fn remove<R>(&mut self, range: R)
+    where
+        R: std::ops::RangeBounds<usize>,
+    {
+        let (start, end) = self.simplify_range_bounds(range);
+        if start >= end {
+            return; // the range is empty
+        }
+
+        let (start_piece_idx, start_char_idx) = self.piece_at_char(start);
+        let (end_piece_idx, end_char_idx) = self.piece_at_char(end);
+
+        if start_piece_idx == end_piece_idx {
+            let piece_idx = start_piece_idx;
+            self.remove_within_piece(piece_idx, start_char_idx, end_char_idx);
+            return;
+        }
+
+        self.trim_piece_start(end_piece_idx, end_char_idx);
+        self.remove_pieces(start_piece_idx + 1..end_piece_idx);
+        self.trim_piece_end(start_piece_idx, start_char_idx);
     }
 
     /// Insert `content` at position `index`.
@@ -38,10 +112,10 @@ impl<'b> PieceTable<'b> {
     ///
     /// ```
     /// # use peace_table::PieceTable;
-    /// let mut pt = PieceTable::new(b"rld");
-    /// pt.insert(0, b"hellowo");
-    /// pt.insert(5, b" ");
-    /// assert_eq!(pt.content(), b"hello world");
+    /// let mut pt = PieceTable::new("rld");
+    /// pt.insert(0, "hellowo");
+    /// pt.insert(5, " ");
+    /// assert_eq!(pt.text(), "hello world");
     /// ```
     ///
     /// ## Panics
@@ -50,111 +124,105 @@ impl<'b> PieceTable<'b> {
     ///
     /// ```should_panic
     /// # use peace_table::PieceTable;
-    /// let mut pt = PieceTable::new(b"012");
-    /// pt.insert(4, b""); // will panic
+    /// let mut pt = PieceTable::new("012");
+    /// pt.insert(4, " "); // will panic
     /// ```
-    pub fn insert(&mut self, index: usize, content: &[u8]) {
-        let (piece_index, insertion_location) =
-            self.find_insertion_location(index);
+    pub fn insert(&mut self, char_idx: usize, text: &str) {
+        let (piece_idx, char_idx) = self.piece_at_char(char_idx);
 
-        match insertion_location {
-            InsertionLocation::Start => {
-                self.insert_piece(piece_index, content);
-            }
-            InsertionLocation::Index(index) => {
-                let split_index = index.get();
-                self.split_piece_and_insert(piece_index, split_index, content);
-            }
-            InsertionLocation::End => {
-                self.insert_piece(piece_index + 1, content);
-            }
+        if char_idx == 0 {
+            self.insert_piece(piece_idx, text);
+        } else if char_idx == self.pieces[piece_idx].len_chars {
+            self.insert_piece(piece_idx + 1, text);
+        } else {
+            // This is guarenteed to be a valid char index inside the piece, due
+            // to an earlier assertion in `piece_at_char`.
+            self.split_piece_and_insert(piece_idx, char_idx, text);
         }
 
-        dbg!(&self.pieces);
-
-        self.total_size += content.len();
+        self.len_chars += text.chars().count();
+        self.len_bytes += text.len();
     }
 
-    /// Allocate a vector with the entire contents of the piece table.
+    /// Total number of chars in the piece table.
     ///
     /// ## Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
-    /// let mut pt = PieceTable::new(b"12");
-    /// pt.insert(2, b"34");
-    /// assert_eq!(pt.content(), b"1234");
-    /// ```
-    pub fn content(&self) -> Vec<u8> {
-        let mut content = Vec::with_capacity(self.total_size);
-        for piece in &self.pieces {
-            let buffer = &self.buffers[piece.buffer];
-            let end = piece.start + piece.length;
-            let slice = &buffer[piece.start..end];
-            content.extend_from_slice(slice);
-        }
-        content
-    }
-
-    /// Returns the total size of the contents of this piece table.
-    ///
-    /// ## Examples
-    ///
-    /// ```
-    /// # use peace_table::PieceTable;
-    /// let mut pt = PieceTable::new(b"123456");
-    /// assert_eq!(pt.size(), 6);
+    /// let mut pt = PieceTable::new("123456");
+    /// assert_eq!(pt.len_chars(), 6);
     /// ```
     #[inline(always)]
-    pub fn size(&self) -> usize {
-        self.total_size
+    pub fn len_chars(&self) -> usize {
+        self.len_chars
+    }
+
+    /// Total number of bytes in the piece table.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// # use peace_table::PieceTable;
+    /// let mut pt = PieceTable::new("1234⑤");
+    /// assert_eq!(pt.len_bytes(), 7); // the 5 takes 3 bytes
+    /// ```
+    #[inline(always)]
+    pub fn len_bytes(&self) -> usize {
+        self.len_bytes
     }
 
     fn split_piece_and_insert(
         &mut self,
-        piece_index: usize,
-        split_index: usize,
-        content: &[u8],
+        piece_idx: usize,
+        char_idx: usize,
+        text: &str,
     ) {
-        let piece = &mut self.pieces[piece_index];
+        let piece = &mut self.pieces[piece_idx];
 
         // Create the `after` piece, before modifying `piece`.
+        let piece_text = &self.buffers[piece.buffer][piece.start..];
+        let byte_idx = char_to_byte(piece_text, char_idx);
         let after = Piece {
             buffer: piece.buffer,
-            start: piece.start + split_index,
-            length: piece.length - split_index,
+            start: piece.start + byte_idx,
+            len_bytes: piece.len_bytes - byte_idx,
+            len_chars: piece.len_chars - char_idx,
         };
 
-        // Modify `piece` to be the `before` piece.
-        piece.length = split_index;
+        // Modify `piece` inplace to be the `before` piece.
+        piece.len_bytes = byte_idx;
+        piece.len_chars = char_idx;
 
         // Insert the new and the `after` piece.
-        self.insert_piece(piece_index + 1, content);
-        self.pieces.insert(piece_index + 2, after);
+        self.insert_piece(piece_idx + 1, text);
+        self.pieces.insert(piece_idx + 2, after);
     }
 
     /// Create a new "add" piece with `content`, and insert that piece at
     /// `index`.
-    fn insert_piece(&mut self, index: usize, content: &[u8]) {
-        let start = self.buffers.add.len();
-        self.buffers.add.extend_from_slice(content);
-        let piece = Piece { buffer: Buffer::Add, start, length: content.len() };
+    fn insert_piece(&mut self, index: usize, text: &str) {
+        let piece = Piece {
+            buffer: Buffer::Add,
+            start: self.buffers.add.len(),
+            len_chars: text.chars().count(),
+            len_bytes: text.len(),
+        };
+
+        self.buffers.add.push_str(text);
         self.pieces.insert(index, piece);
     }
 
-    fn find_insertion_location(
-        &self,
-        index: usize,
-    ) -> (usize, InsertionLocation) {
-        assert!(index <= self.total_size, "index out of bounds");
+    fn piece_at_char(&self, char_idx: usize) -> (usize, usize) {
+        assert!(char_idx <= self.len_chars, "index out of bounds");
 
-        let mut offset = 0;
+        let mut char_offset = 0;
         for (i, piece) in self.pieces.iter().enumerate() {
-            offset += piece.length;
+            char_offset += piece.len_chars;
 
-            if offset >= index {
-                let relative_index = index - (offset - piece.length);
-                return (i, piece.calc_insertion_location(relative_index));
+            if char_offset >= char_idx {
+                let relative_idx = char_idx - (char_offset - piece.len_chars);
+                return (i, relative_idx);
             }
         }
 
@@ -163,77 +231,93 @@ impl<'b> PieceTable<'b> {
              size of all the pieces together, but this was already asserted"
         )
     }
-}
 
-/// Where an insertion should occur, relative to some piece.
-enum InsertionLocation {
-    Start,
-    Index(NonZeroUsize),
-    End,
-}
+    fn simplify_range_bounds<R>(&mut self, range: R) -> (usize, usize)
+    where
+        R: std::ops::RangeBounds<usize>,
+    {
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&i) => i,
+            std::ops::Bound::Excluded(&i) => i + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&i) => i + 1,
+            std::ops::Bound::Excluded(&i) => i,
+            std::ops::Bound::Unbounded => self.len_chars,
+        };
+        (start, end)
+    }
 
-#[derive(Debug, Clone, Copy)]
-enum Buffer {
-    Original,
-    Add,
-}
+    fn trim_piece_end(&mut self, piece_idx: usize, start_char_idx: usize) {
+        let piece = &mut self.pieces[piece_idx];
+        let text = &self.buffers[piece.buffer][piece.byte_range()];
 
-struct Buffers<'b> {
-    original: &'b [u8],
-    add: Vec<u8>,
-}
-
-impl<'b> Index<Buffer> for Buffers<'b> {
-    type Output = [u8];
-
-    fn index(&self, index: Buffer) -> &Self::Output {
-        match index {
-            Buffer::Original => self.original,
-            Buffer::Add => &self.add,
+        if start_char_idx == 0 {
+            self.pieces.remove(piece_idx);
+        } else if start_char_idx < piece.len_chars {
+            let byte_idx = char_to_byte(text, start_char_idx);
+            self.len_chars -= piece.len_chars - start_char_idx;
+            self.len_bytes -= piece.len_bytes - byte_idx;
+            piece.len_bytes = byte_idx;
+            piece.len_chars = start_char_idx;
         }
     }
-}
 
-#[derive(Debug)]
-struct Piece {
-    /// Which [`Buffer`] is this piece referencing.
-    buffer: Buffer,
-    /// Start index in the buffer.
-    start: usize,
-    /// Length of the content this piece is referencing.
-    length: usize,
-}
+    fn trim_piece_start(&mut self, piece_idx: usize, end_char_idx: usize) {
+        let piece = &mut self.pieces[piece_idx];
+        let text = &self.buffers[piece.buffer][piece.byte_range()];
 
-impl Piece {
-    /// ## Panics
-    ///
-    /// Will panic if `index` is larger than the piece's length.
-    ///
-    /// Note: that means that even though the index is zero-based, it can still
-    /// be equal to the length of the piece (i.e., `0..=length` and not
-    /// `0..length`).
-    fn calc_insertion_location(&self, index: usize) -> InsertionLocation {
-        assert!(self.length >= index, "index out of bounds");
-
-        if index == 0 {
-            InsertionLocation::Start
-        } else if index == self.length {
-            InsertionLocation::End
-        } else {
-            // SAFETY: `index == 0` was covered by an earlier branch.
-            InsertionLocation::Index(unsafe { NonZero::new_unchecked(index) })
+        if end_char_idx == piece.len_chars {
+            self.pieces.remove(piece_idx);
+        } else if end_char_idx > 0 {
+            let byte_idx = char_to_byte(text, end_char_idx);
+            piece.start += byte_idx;
+            piece.len_bytes -= byte_idx;
+            piece.len_chars -= end_char_idx;
+            self.len_chars -= end_char_idx;
+            self.len_bytes -= byte_idx;
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+    fn remove_within_piece(
+        &mut self,
+        piece_idx: usize,
+        start_char_idx: usize,
+        end_char_idx: usize,
+    ) {
+        let piece = &mut self.pieces[piece_idx];
+        let text = &self.buffers[piece.buffer][piece.byte_range()];
 
-    #[test]
-    fn insert() {
-        let mut pt = PieceTable::new(b"helloworld");
-        pt.insert(5, b" ");
-        assert_eq!(pt.content(), b"hello world");
+        // If the range describes an entire piece, remove it.
+        if start_char_idx == 0 && end_char_idx == piece.len_chars {
+            let piece = &self.pieces[piece_idx];
+            self.len_bytes -= piece.len_bytes;
+            self.len_chars -= piece.len_chars;
+            self.pieces.remove(piece_idx);
+            return;
+        }
+
+        let start_offset = char_to_byte(text, start_char_idx);
+        let end_offset = char_to_byte(text, end_char_idx);
+
+        let new_len_bytes = end_offset - start_offset;
+        let new_len_chars = end_char_idx - start_char_idx;
+
+        piece.start += start_offset;
+        piece.len_bytes = new_len_bytes;
+        piece.len_chars = new_len_chars;
+
+        let removed_bytes = piece.len_bytes - new_len_bytes;
+        self.len_bytes -= removed_bytes;
+        let removed_chars = piece.len_chars - new_len_chars;
+        self.len_chars -= removed_chars;
+    }
+
+    fn remove_pieces(&mut self, range: std::ops::Range<usize>) {
+        self.pieces.drain(range).for_each(|p| {
+            self.len_chars -= p.len_chars;
+            self.len_bytes -= p.len_bytes;
+        });
     }
 }
