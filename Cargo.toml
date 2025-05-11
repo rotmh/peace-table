@@ -2,6 +2,13 @@
 name = "peace-table"
 version = "0.1.0"
 edition = "2024"
+description = "A UTF-8, char oriented, text editing optimized, Piece Table implementation"
+authors = ["Rotem Horesh (rotmh)"]
+license-file = "./LICENSE"
+license = "MIT"
+repository = "https://github.com/rotmh/peace-table"
+exclude = ["justfile"]
+keywords = ["data-structure", "piece-table", "utf8"]
 
 [dependencies]
 str_indices = "0.4"
@@ -11,9 +18,3 @@ default = ["optimizations"]
 
 optimizations = ["contiguous-inserts"]
 contiguous-inserts = []
-
-[profile.release]
-lto = "fat"
-codegen-units = 1
-debug = true
-strip = false

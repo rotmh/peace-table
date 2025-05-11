@@ -1,3 +1,8 @@
+//! A UTF-8, char oriented, text editing optimized, [Piece Table]
+//! implementation.
+//!
+//! [Piece Table]: https://en.wikipedia.org/wiki/Piece_table
+
 #![feature(test)]
 
 mod buffer;
@@ -430,7 +435,13 @@ mod tests {
         let letters = ('b'..='f').map(|ch| ch.to_string());
         letters.enumerate().for_each(|(i, ch)| pt.insert(i + 1, &ch));
 
-        assert_eq!(pt.text(), "abcdefg")
+        assert_eq!(pt.text(), "abcdefg");
+
+        if cfg!(feature = "contiguous-inserts") {
+            assert_eq!(pt.pieces.len(), 3);
+        } else {
+            assert_eq!(pt.pieces.len(), 7);
+        }
     }
 }
 
