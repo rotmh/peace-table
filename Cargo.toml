@@ -5,3 +5,15 @@ edition = "2024"
 
 [dependencies]
 str_indices = "0.4"
+
+[features]
+default = ["optimizations"]
+
+optimizations = ["contiguous-inserts"]
+contiguous-inserts = []
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+debug = true
+strip = false

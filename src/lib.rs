@@ -1,3 +1,5 @@
+#![feature(test)]
+
 mod buffer;
 mod piece;
 
@@ -14,12 +16,23 @@ pub struct PieceTable<'b> {
 
     len_chars: usize,
     len_bytes: usize,
+
+    /// The char index after the last insertion, and the piece the last
+    /// insertion was inserting to (i.e., `(char, piece)`). If there is no last
+    /// insertion, or the last edit is not an insertion (thus invalidating
+    /// the `last_insert` value), it will contain a [`None`].
+    ///
+    /// This is used as an optimization, so that instead of creating a new
+    /// piece when inserting contiguous text (for every insert), we will just
+    /// expand the last piece.
+    #[cfg(feature = "contiguous-inserts")]
+    last_insert: Option<(usize, usize)>,
 }
 
 impl<'b> PieceTable<'b> {
     /// Create a new [`PieceTable`] with the initial contents set to `initial`.
     ///
-    /// ## Examples
+    /// # Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
@@ -39,6 +52,8 @@ impl<'b> PieceTable<'b> {
             buffers: Buffers::from_initial(initial),
             len_chars: count_chars(initial),
             len_bytes: initial.len(),
+            #[cfg(feature = "contiguous-inserts")]
+            last_insert: None,
         }
     }
 
@@ -47,7 +62,7 @@ impl<'b> PieceTable<'b> {
     /// This function allocates a new string. You can use [`PieceTable::iter`]
     /// to iterate over `&str` chunks without allocations.
     ///
-    /// ## Examples
+    /// # Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
@@ -57,12 +72,12 @@ impl<'b> PieceTable<'b> {
     /// ```
     pub fn text(&self) -> String {
         let mut text = String::with_capacity(self.len_bytes);
+
         for piece in &self.pieces {
             let end = piece.start + piece.len_bytes;
             text.push_str(&self.buffers[piece.buffer][piece.start..end]);
         }
 
-        dbg!(&text);
         debug_assert_eq!(text.len(), self.len_bytes);
         debug_assert_eq!(count_chars(&text), self.len_chars);
 
@@ -71,7 +86,7 @@ impl<'b> PieceTable<'b> {
 
     /// Removes the text in the given char index range.
     ///
-    /// ## Examples
+    /// # Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
@@ -104,6 +119,13 @@ impl<'b> PieceTable<'b> {
             return; // the range is empty
         }
 
+        #[cfg(feature = "contiguous-inserts")]
+        if self.last_insert.is_some_and(|(i, _piece)| i >= start) {
+            // If the removal is _after_ the index of the last insert, it does
+            // not affect it.
+            self.last_insert = None;
+        }
+
         let (start_piece_idx, start_char_idx) = self.piece_at_char(start);
         let (end_piece_idx, end_char_idx) = self.piece_at_char(end);
 
@@ -120,7 +142,7 @@ impl<'b> PieceTable<'b> {
 
     /// Insert `content` at position `index`.
     ///
-    /// ## Examples
+    /// # Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
@@ -130,7 +152,7 @@ impl<'b> PieceTable<'b> {
     /// assert_eq!(pt.text(), "hello world");
     /// ```
     ///
-    /// ## Panics
+    /// # Panics
     ///
     /// Will panic if index is larger than the size of the contents.
     ///
@@ -140,27 +162,45 @@ impl<'b> PieceTable<'b> {
     /// pt.insert(4, " "); // will panic
     /// ```
     pub fn insert(&mut self, char_idx: usize, text: &str) {
-        let (piece_idx, char_idx) = self.piece_at_char(char_idx);
+        let len_chars = count_chars(text);
 
-        if char_idx == 0 {
+        self.len_chars += len_chars;
+        self.len_bytes += text.len();
+
+        #[cfg(feature = "contiguous-inserts")]
+        if let Some((ref mut i, piece_idx)) = self.last_insert
+            && *i == char_idx
+        {
+            *i += len_chars;
+            self.extend_piece(text, len_chars, piece_idx);
+            return;
+        }
+
+        let (piece_idx, relative_char_idx) = self.piece_at_char(char_idx);
+
+        if relative_char_idx == 0 {
             self.insert_piece(piece_idx, text);
-        } else if char_idx == self.pieces[piece_idx].len_chars {
+        } else if relative_char_idx == self.pieces[piece_idx].len_chars {
             self.insert_piece(piece_idx + 1, text);
         } else {
             // This is guarenteed to be a valid char index inside the piece, due
             // to an earlier assertion in `piece_at_char`.
-            self.split_piece_and_insert(piece_idx, char_idx, text);
+            self.split_piece_and_insert(piece_idx, relative_char_idx, text);
         }
 
-        self.len_chars += text.chars().count();
-        self.len_bytes += text.len();
+        #[cfg(feature = "contiguous-inserts")]
+        {
+            let piece_idx =
+                if relative_char_idx == 0 { piece_idx } else { piece_idx + 1 };
+            self.last_insert = Some((char_idx + len_chars, piece_idx));
+        }
     }
 
     /// Total number of chars in the piece table.
     ///
     /// Runs in `O(1)`.
     ///
-    /// ## Examples
+    /// # Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
@@ -176,7 +216,7 @@ impl<'b> PieceTable<'b> {
     ///
     /// Runs in `O(1)`.
     ///
-    /// ## Examples
+    /// # Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
@@ -217,7 +257,7 @@ impl<'b> PieceTable<'b> {
 
     /// Returns an iterator over all the `&str` chunks in the table.
     ///
-    /// ## Examples
+    /// # Examples
     ///
     /// ```
     /// # use peace_table::PieceTable;
@@ -246,12 +286,12 @@ impl<'b> PieceTable<'b> {
     fn piece_at_char(&self, char_idx: usize) -> (usize, usize) {
         assert!(char_idx <= self.len_chars, "index out of bounds");
 
-        let mut char_offset = 0;
+        let mut offset = 0;
         for (i, piece) in self.pieces.iter().enumerate() {
-            char_offset += piece.len_chars;
+            offset += piece.len_chars;
 
-            if char_offset >= char_idx {
-                let relative_idx = char_idx - (char_offset - piece.len_chars);
+            if offset >= char_idx {
+                let relative_idx = char_idx - (offset - piece.len_chars);
                 return (i, relative_idx);
             }
         }
@@ -350,10 +390,72 @@ impl<'b> PieceTable<'b> {
             self.len_bytes -= p.len_bytes;
         });
     }
+
+    /// Extend a piece's end, and inserts the text to the end of the `add`
+    /// buffer. This function assumes that the last insert to the table was to
+    /// the end of the piece.
+    #[cfg(feature = "contiguous-inserts")]
+    fn extend_piece(
+        &mut self,
+        text: &str,
+        text_len_chars: usize,
+        piece_idx: usize,
+    ) {
+        let piece = &mut self.pieces[piece_idx];
+
+        debug_assert_eq!(piece.buffer, Buffer::Add);
+        debug_assert_eq!(self.buffers.add.len(), piece.byte_range().end);
+
+        piece.len_bytes += text.len();
+        piece.len_chars += text_len_chars;
+
+        self.buffers.add.push_str(text);
+    }
 }
 
 impl std::fmt::Display for PieceTable<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         self.iter().try_for_each(|p| write!(f, "{p}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contiguous_insertion() {
+        let mut pt = PieceTable::new("ag");
+
+        let letters = ('b'..='f').map(|ch| ch.to_string());
+        letters.enumerate().for_each(|(i, ch)| pt.insert(i + 1, &ch));
+
+        assert_eq!(pt.text(), "abcdefg")
+    }
+}
+
+#[cfg(test)]
+mod benches {
+    extern crate test;
+
+    use self::test::Bencher;
+    use std::process::Termination;
+
+    use super::*;
+
+    #[bench]
+    fn bench_sequential_inserts(b: &mut Bencher) -> impl Termination {
+        b.iter(|| {
+            const CH: &str = "a";
+            let mut pt = PieceTable::new("asdfjlkajslkdfjlkajsldkfjlkasjdlkfj");
+            for i in 10..10000 {
+                pt.insert(i, CH);
+            }
+            pt.insert(2, CH);
+            pt.remove(4..294);
+            for i in 3..5531 {
+                pt.insert(i, CH);
+            }
+        });
     }
 }
