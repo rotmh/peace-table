@@ -23,7 +23,7 @@ impl<'b> PieceTable<'b> {
     ///
     /// ```
     /// # use peace_table::PieceTable;
-    /// let mut pt = PieceTable::new("initial");
+    /// let pt = PieceTable::new("initial");
     /// assert_eq!(pt.text(), "initial");
     /// ```
     pub fn new(initial: &'b str) -> Self {
@@ -43,6 +43,18 @@ impl<'b> PieceTable<'b> {
     }
 
     /// Collect the text from the piece table.
+    ///
+    /// This function allocates a new string. You can use [`PieceTable::iter`]
+    /// to iterate over `&str` chunks without allocations.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// # use peace_table::PieceTable;
+    /// let mut pt = PieceTable::new("content");
+    /// pt.insert(0, "abcd, ");
+    /// assert_eq!(pt.text(), "abcd, content");
+    /// ```
     pub fn text(&self) -> String {
         let mut text = String::with_capacity(self.len_bytes);
         for piece in &self.pieces {
@@ -146,6 +158,8 @@ impl<'b> PieceTable<'b> {
 
     /// Total number of chars in the piece table.
     ///
+    /// Runs in `O(1)`.
+    ///
     /// ## Examples
     ///
     /// ```
@@ -159,6 +173,8 @@ impl<'b> PieceTable<'b> {
     }
 
     /// Total number of bytes in the piece table.
+    ///
+    /// Runs in `O(1)`.
     ///
     /// ## Examples
     ///
@@ -242,7 +258,7 @@ impl<'b> PieceTable<'b> {
 
         unreachable!(
             "this code will be ran only if `index` is larger than the total \
-             size of all the pieces together, but this was already asserted"
+             size len all the pieces together, but this was already asserted"
         )
     }
 
