@@ -199,6 +199,20 @@ impl<'b> PieceTable<'b> {
         self.pieces.insert(piece_idx + 2, after);
     }
 
+    /// Returns an iterator over all the `&str` chunks in the table.
+    ///
+    /// ## Examples
+    ///
+    /// ```
+    /// # use peace_table::PieceTable;
+    /// let mut pt = PieceTable::new("hithere");
+    /// pt.insert(2, ", and hello, ");
+    /// assert_eq!(pt.iter().collect::<String>(), "hi, and hello, there");
+    /// ```
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        self.pieces.iter().map(|p| &self.buffers[p.buffer][p.byte_range()])
+    }
+
     /// Create a new "add" piece with `content`, and insert that piece at
     /// `index`.
     fn insert_piece(&mut self, index: usize, text: &str) {
