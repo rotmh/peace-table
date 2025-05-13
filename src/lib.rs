@@ -1,31 +1,36 @@
-//! A UTF-8, char oriented, text editing optimized, [Piece Table]
+//! A UTF-8; char and line oriented; text editing optimized; [Piece Table]
 //! implementation.
 //!
 //! [Piece Table]: https://en.wikipedia.org/wiki/Piece_table
 
-#![feature(test)]
+#![feature(test, if_let_guard, stmt_expr_attributes)]
 
 mod buffer;
+#[cfg(feature = "lines")]
+mod line;
 mod piece;
+mod rbtree;
+mod slice;
+mod str_utils;
 
-use str_indices::chars::count as count_chars;
-use str_indices::chars::to_byte_idx as char_to_byte;
-
-use buffer::{Buffer, Buffers};
+use buffer::{BufferType, Buffers};
 use piece::Piece;
+use slice::Slice;
 
 #[derive(Debug)]
 pub struct PieceTable<'b> {
     pieces: Vec<Piece>,
     buffers: Buffers<'b>,
 
-    len_chars: usize,
     len_bytes: usize,
+    len_chars: usize,
+    #[cfg(feature = "lines")]
+    len_lines: usize,
 
     /// The char index after the last insertion, and the piece the last
-    /// insertion was inserting to (i.e., `(char, piece)`). If there is no last
-    /// insertion, or the last edit is not an insertion (thus invalidating
-    /// the `last_insert` value), it will contain a [`None`].
+    /// insertion was inserting to (i.e., `(char_idx, piece_idx)`). If there is
+    /// no last insertion, or the last edit is not an insertion (thus
+    /// invalidating the `last_insert` value), it will contain a [`None`].
     ///
     /// This is used as an optimization, so that instead of creating a new
     /// piece when inserting contiguous text (for every insert), we will just
@@ -45,20 +50,30 @@ impl<'b> PieceTable<'b> {
     /// assert_eq!(pt.text(), "initial");
     /// ```
     pub fn new(initial: &'b str) -> Self {
+        let buffers = Buffers::from_initial(initial);
         let initial_piece = Piece {
-            buffer: Buffer::Original,
+            buffer: BufferType::Original,
             start: 0,
             len_bytes: initial.len(),
-            len_chars: count_chars(initial),
+            len_chars: str_utils::count_chars(initial),
+            first_line_break: if buffers.original.line_breaks.is_empty() {
+                None
+            } else {
+                Some(0)
+            },
         };
 
         Self {
-            pieces: vec![initial_piece],
-            buffers: Buffers::from_initial(initial),
-            len_chars: count_chars(initial),
             len_bytes: initial.len(),
+            len_chars: str_utils::count_chars(initial),
+            #[cfg(feature = "lines")]
+            len_lines: buffers.original.line_breaks.len() + 1,
+
             #[cfg(feature = "contiguous-inserts")]
             last_insert: None,
+
+            buffers,
+            pieces: vec![initial_piece],
         }
     }
 
@@ -79,14 +94,65 @@ impl<'b> PieceTable<'b> {
         let mut text = String::with_capacity(self.len_bytes);
 
         for piece in &self.pieces {
-            let end = piece.start + piece.len_bytes;
-            text.push_str(&self.buffers[piece.buffer][piece.start..end]);
+            text.push_str(&self.buffers[piece.buffer][piece.byte_range()]);
         }
 
         debug_assert_eq!(text.len(), self.len_bytes);
-        debug_assert_eq!(count_chars(&text), self.len_chars);
+        debug_assert_eq!(str_utils::count_chars(&text), self.len_chars);
 
         text
+    }
+
+    /// Returns a [`Slice`] containing the `line_idx`-th line, **without** the
+    /// line break sequence.
+    ///
+    /// # Panics
+    ///
+    /// Will panic if `line_idx` is out of bounds (i.e., there is no such line).
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use peace_table::PieceTable;
+    /// let mut pt = PieceTable::new("FirstSecond");
+    /// pt.insert(5, "\r\n");
+    /// assert_eq!(pt.line(1).to_string(), "Second");
+    /// ```
+    #[cfg(feature = "lines")]
+    pub fn line(&self, line_idx: usize) -> Slice {
+        assert!(line_idx < self.len_lines, "line index out of bounds");
+
+        let mut current_line = 0;
+        let mut start = (0, 0);
+
+        for (piece_idx, piece) in self.pieces.iter().enumerate() {
+            let Some(first_lb) = piece.first_line_break else { continue };
+
+            let line_breaks = self.buffers.line_breaks(piece.buffer)
+                [first_lb..]
+                .iter()
+                .take_while(|(i, _)| *i < piece.byte_range().end);
+
+            for &(idx, ty) in line_breaks {
+                let relative_idx = idx - piece.start;
+
+                if current_line == line_idx {
+                    let end = (piece_idx, relative_idx);
+                    return Slice::new(start, end, self);
+                }
+                if current_line + 1 == line_idx {
+                    start = (piece_idx, relative_idx + ty.len_bytes());
+                }
+
+                current_line += 1;
+            }
+        }
+
+        debug_assert_eq!(line_idx, self.len_lines - 1);
+
+        let last_idx = self.pieces.len() - 1;
+        let end_byte = self.pieces[last_idx].len_bytes;
+        Slice::new(start, (last_idx, end_byte), self)
     }
 
     /// Removes the text in the given char index range.
@@ -112,7 +178,7 @@ impl<'b> PieceTable<'b> {
     /// ```
     /// # use peace_table::PieceTable;
     /// let mut pt = PieceTable::new("012345");
-    /// pt.remove(5..0);
+    /// pt.remove(5..0); // an empty range
     /// assert_eq!(pt.text(), "012345"); // unchanged
     /// ```
     pub fn remove<R>(&mut self, range: R)
@@ -124,10 +190,10 @@ impl<'b> PieceTable<'b> {
             return; // the range is empty
         }
 
+        // If the removal is _after_ the index of the last insert, it does not
+        // affect it.
         #[cfg(feature = "contiguous-inserts")]
         if self.last_insert.is_some_and(|(i, _piece)| i >= start) {
-            // If the removal is _after_ the index of the last insert, it does
-            // not affect it.
             self.last_insert = None;
         }
 
@@ -167,7 +233,7 @@ impl<'b> PieceTable<'b> {
     /// pt.insert(4, " "); // will panic
     /// ```
     pub fn insert(&mut self, char_idx: usize, text: &str) {
-        let len_chars = count_chars(text);
+        let len_chars = str_utils::count_chars(text);
 
         self.len_chars += len_chars;
         self.len_bytes += text.len();
@@ -241,17 +307,32 @@ impl<'b> PieceTable<'b> {
     ) {
         let piece = &mut self.pieces[piece_idx];
 
-        // Create the `after` piece, before modifying `piece`.
         let piece_text = &self.buffers[piece.buffer][piece.start..];
-        let byte_idx = char_to_byte(piece_text, char_idx);
+
+        // TODO: should we make this a `debug_assert!`?
+        assert!(
+            !(piece_text.as_bytes()[char_idx - 1] == 0x0D
+                && piece_text.as_bytes()[char_idx] == 0x0A),
+            "inserting inside a CRLF sequece is invalid"
+        );
+
+        // Create the `after` piece, before modifying `piece`.
+        let byte_idx = str_utils::char_to_byte(piece_text, char_idx);
+        let after_start = piece.start + byte_idx;
+        let after_end = after_start + piece.len_bytes - byte_idx;
+        let first_line_break = piece.first_line_break.and_then(|flb| {
+            let mut lbs = self.buffers.line_breaks(piece.buffer)[flb..].iter();
+            lbs.find(|(idx, _ty)| *idx >= after_start && *idx < after_end)
+        });
         let after = Piece {
             buffer: piece.buffer,
-            start: piece.start + byte_idx,
+            start: after_start,
+            first_line_break: first_line_break.map(|(idx, _ty)| idx).copied(),
             len_bytes: piece.len_bytes - byte_idx,
             len_chars: piece.len_chars - char_idx,
         };
 
-        // Modify `piece` inplace to be the `before` piece.
+        // Modify `piece` in-place to be the `before` piece.
         piece.len_bytes = byte_idx;
         piece.len_chars = char_idx;
 
@@ -277,14 +358,23 @@ impl<'b> PieceTable<'b> {
     /// Create a new "add" piece with `content`, and insert that piece at
     /// `index`.
     fn insert_piece(&mut self, index: usize, text: &str) {
+        let first_lb = self.buffers.add.line_breaks.len();
+        self.len_lines += str_utils::line_breaks(
+            text,
+            &mut self.buffers.add.line_breaks,
+            self.buffers.add.content.len(),
+        );
+
         let piece = Piece {
-            buffer: Buffer::Add,
-            start: self.buffers.add.len(),
-            len_chars: text.chars().count(),
+            buffer: BufferType::Add,
+            start: self.buffers.add.content.len(),
+            first_line_break: (first_lb < self.buffers.add.line_breaks.len())
+                .then_some(first_lb),
+            len_chars: str_utils::count_chars(text),
             len_bytes: text.len(),
         };
 
-        self.buffers.add.push_str(text);
+        self.buffers.add.content.push_str(text);
         self.pieces.insert(index, piece);
     }
 
@@ -329,13 +419,20 @@ impl<'b> PieceTable<'b> {
         let text = &self.buffers[piece.buffer][piece.byte_range()];
 
         if start_char_idx == 0 {
-            self.pieces.remove(piece_idx);
+            self.remove_piece(piece_idx);
         } else if start_char_idx < piece.len_chars {
-            let byte_idx = char_to_byte(text, start_char_idx);
+            let byte_idx = str_utils::char_to_byte(text, start_char_idx);
             self.len_chars -= piece.len_chars - start_char_idx;
             self.len_bytes -= piece.len_bytes - byte_idx;
             piece.len_bytes = byte_idx;
             piece.len_chars = start_char_idx;
+
+            // Unset the `first_line_break` if it was in the removed part.
+            #[cfg(feature = "lines")]
+            piece
+                .first_line_break
+                .as_ref()
+                .take_if(|flb| **flb >= piece.byte_range().end);
         }
     }
 
@@ -344,15 +441,37 @@ impl<'b> PieceTable<'b> {
         let text = &self.buffers[piece.buffer][piece.byte_range()];
 
         if end_char_idx == piece.len_chars {
-            self.pieces.remove(piece_idx);
+            self.remove_piece(piece_idx);
         } else if end_char_idx > 0 {
-            let byte_idx = char_to_byte(text, end_char_idx);
+            let byte_idx = str_utils::char_to_byte(text, end_char_idx);
             piece.start += byte_idx;
             piece.len_bytes -= byte_idx;
             piece.len_chars -= end_char_idx;
             self.len_chars -= end_char_idx;
             self.len_bytes -= byte_idx;
+
+            #[cfg(feature = "lines")]
+            piece.first_line_break = piece.first_line_break.and_then(|flb| {
+                // WARNING: if there is no matching line break, it will iterate
+                // over _all_ of the line breaks. fix that.
+                let mut lbs =
+                    self.buffers.line_breaks(piece.buffer)[flb..].iter();
+                Some(lbs.find(|(idx, _ty)| piece.byte_range().contains(idx))?.0)
+            });
         }
+    }
+
+    fn remove_piece(&mut self, piece_idx: usize) {
+        let piece = &self.pieces[piece_idx];
+        #[cfg(feature = "lines")]
+        let lbs = self.count_piece_line_breaks(piece_idx);
+
+        self.len_bytes -= piece.len_bytes;
+        self.len_chars -= piece.len_chars;
+        #[cfg(feature = "lines")]
+        self.len_lines -= lbs;
+
+        self.pieces.remove(piece_idx);
     }
 
     fn remove_within_piece(
@@ -373,8 +492,8 @@ impl<'b> PieceTable<'b> {
             return;
         }
 
-        let start_offset = char_to_byte(text, start_char_idx);
-        let end_offset = char_to_byte(text, end_char_idx);
+        let start_offset = str_utils::char_to_byte(text, start_char_idx);
+        let end_offset = str_utils::char_to_byte(text, end_char_idx);
 
         let new_len_bytes = end_offset - start_offset;
         let new_len_chars = end_char_idx - start_char_idx;
@@ -408,13 +527,38 @@ impl<'b> PieceTable<'b> {
     ) {
         let piece = &mut self.pieces[piece_idx];
 
-        debug_assert_eq!(piece.buffer, Buffer::Add);
-        debug_assert_eq!(self.buffers.add.len(), piece.byte_range().end);
+        debug_assert_eq!(piece.buffer, BufferType::Add);
+        debug_assert_eq!(
+            self.buffers.add.content.len(),
+            piece.byte_range().end
+        );
+
+        self.len_lines += str_utils::line_breaks(
+            text,
+            &mut self.buffers.add.line_breaks,
+            piece.byte_range().end,
+        );
 
         piece.len_bytes += text.len();
         piece.len_chars += text_len_chars;
 
-        self.buffers.add.push_str(text);
+        self.buffers.add.content.push_str(text);
+    }
+
+    /// Count the amount of line breaks that a piece contains.
+    ///
+    /// Runs in `O(N)` where `N` is the amount of line breaks in the piece (this
+    /// is a good time complexity).
+    #[cfg(feature = "lines")]
+    fn count_piece_line_breaks(&self, piece_idx: usize) -> usize {
+        let piece = &self.pieces[piece_idx];
+        if let Some(first_lb) = piece.first_line_break {
+            let lbs = self.buffers.line_breaks(piece.buffer)[first_lb..].iter();
+            let (s, e) = (piece.start, piece.byte_range().end);
+            lbs.take_while(|(idx, _ty)| *idx >= s && *idx < e).count()
+        } else {
+            0
+        }
     }
 }
 

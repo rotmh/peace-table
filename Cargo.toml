@@ -4,7 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "A UTF-8, char oriented, text editing optimized, Piece Table implementation"
 authors = ["Rotem Horesh (rotmh)"]
-license-file = "./LICENSE"
 license = "MIT"
 repository = "https://github.com/rotmh/peace-table"
 exclude = ["justfile"]
@@ -14,7 +13,15 @@ keywords = ["data-structure", "piece-table", "utf8"]
 str_indices = "0.4"
 
 [features]
-default = ["optimizations"]
+default = ["contiguous-inserts", "lines", "unicode-line-breaks"]
 
-optimizations = ["contiguous-inserts"]
+# An optimization which only extends a piece when inserting to the end of the
+# same piece continuously, instead of creating a new piece for each insert.
+# This is a big win for typing characters continguously, for example.
 contiguous-inserts = []
+
+# Whether to address unicode defined line breaks as line breaks.
+unicode-line-breaks = []
+
+# Whether to keep track of lines, and enable line-related methods.
+lines = []
